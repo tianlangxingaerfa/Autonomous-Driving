@@ -31,9 +31,21 @@ class Configurator:
     FIXED_DELTA_SECONDS = 0.05  # 20 Hz
 
     # Ego vehicle
-    VEHICLE_BLUEPRINT = "vehicle.tesla.model3"
-    TARGET_SPEED      = 5.0   # m/s (~18 km/h)
-    SPEED_KP          = 0.5
+    VEHICLE_BLUEPRINT  = "vehicle.tesla.model3"                                                                      
+    FREE_CRUISE_SPEED  = 20.0   # m/s (~43 km/h) — target on a clear road
+    MIN_FOLLOW_SPEED   = 0.0    # m/s — allow full stop behind a stopped actor
+    CLEAR_HORIZON      = 30.0   # m — beyond this, ahead is considered clear
+    CLEAR_CONE         = 20.0   # half-angle (deg) of forward clearance cone
+    LANE_WIDTH_HALF    = 2.0    # m — actors beyond this lateral offset are treated as other-lane
+    CLOSING_SPEED_GAIN = 1.0    # seconds of closing-speed lookahead (reduced: less aggressive at distance)
+    SAFE_STOP_GAP      = 15.0   # m — start tapering speed toward 0 when stopped actor is within this range
+    STOP_DISTANCE      = 8.0    # m — centroid-to-centroid target gap (~4.7 m vehicle + 3.3 m clear space)
+    STOP_ACTOR_SPEED   = 1.0    # m/s — actor speed below which we treat it as stopped
+    SPEED_KP           = 0.5
+
+    # Control smoothing (EMA)                                                                                        
+    SMOOTH_ACCEL_ALPHA = 0.35   # EMA weight for net-accel; lower = smoother                                         
+    SMOOTH_STEER_ALPHA = 0.45   # EMA weight for steer
 
     # STM
     STM_BUFFER_LEN = 20
@@ -42,10 +54,10 @@ class Configurator:
     PREDICTION_HORIZON = 15   # steps to predict forward (~0.75 s)
 
     # Cost weights
-    W_LANE_CENTER  = 1.0
-    W_SPEED_TRACK  = 2.0    # strong pull toward target speed
-    W_COMFORT_JERK = 0.3
-    W_COLLISION    = 20.0   # avoidance priority, but not overwhelming
+    W_LANE_CENTER  = 5.0   # raised: penalise lateral drift throughout the trajectory
+    W_SPEED_TRACK  = 2.0   # strong pull toward target speed
+    W_COMFORT_JERK = 1.0
+    W_COLLISION    = 20.0  # avoidance priority, but not overwhelming
     W_TRAFFIC_RULE = 5.0
 
     # Collision geometry
@@ -66,7 +78,7 @@ class Configurator:
 
     # Emergency reactive layer
     EMERGENCY_DIST  = 6.0      # m — trigger hard brake + steer
-    EMERGENCY_CONE  = 40.0     # half-angle (deg) of forward threat cone
+    EMERGENCY_CONE  = 25.0     # half-angle (deg) — narrowed to stop overreacting to side actors
 
 
 # ---------------------------------------------------------------------------
@@ -230,33 +242,38 @@ class IntrinsicCost:
         actions: np.ndarray,         # (H, 3): [throttle, steer, brake]
         waypoint,
         current_speed: float,
+        desired_speed: float,
     ) -> float:
         cfg = self.cfg
 
-        # Lane-center deviation: lateral distance only (project onto waypoint normal)
-        # This ignores along-lane progress so forward motion is not penalised.
+        # Lane-center deviation: average lateral error across every predicted step.
+        # Using only the endpoint allowed mid-trajectory drift at zero cost.
         if waypoint is not None:
             wp_loc = waypoint.transform.location
             wp_yaw = math.radians(waypoint.transform.rotation.yaw)
-            # Lane forward direction
-            fwd_x, fwd_y = math.cos(wp_yaw), math.sin(wp_yaw)
-            dx = ego_traj[-1, 0] - wp_loc.x
-            dy = ego_traj[-1, 1] - wp_loc.y
-            # Lateral component = cross product magnitude
-            lat_err = abs(dx * (-fwd_y) + dy * fwd_x)
+            fwd_x, fwd_y   = math.cos(wp_yaw), math.sin(wp_yaw)
+            lat_norm_x = -fwd_y
+            lat_norm_y =  fwd_x
+            # Accumulate lateral error for every step after the initial one
+            total_lat = 0.0
+            for step in range(1, ego_traj.shape[0]):
+                dx = ego_traj[step, 0] - wp_loc.x
+                dy = ego_traj[step, 1] - wp_loc.y
+                total_lat += abs(dx * lat_norm_x + dy * lat_norm_y)
+            lat_err = total_lat / max(ego_traj.shape[0] - 1, 1)
         else:
             lat_err = 0.0
 
-        # Speed tracking: use throttle-vs-brake net to estimate end speed,
-        # penalise deviation from target regardless of direction of approach
+        # Speed tracking against dynamic desired_speed
         mean_throttle = float(np.mean(actions[:, 0]))
         mean_brake    = float(np.mean(actions[:, 2]))
-        # Rough final speed estimate from kinematics (accel_scale=4 m/s², same as simulator)
         estimated_speed = max(0.0, current_speed + (mean_throttle - mean_brake) * 4.0 * actions.shape[0] * 0.05)
-        speed_err = abs(estimated_speed - cfg.TARGET_SPEED)
+        speed_err = abs(estimated_speed - desired_speed) 
 
-        # Jerk proxy: variance in throttle/brake actions across horizon
-        jerk = float(np.std(actions[:, 0]) + np.std(actions[:, 2]))
+        # Jerk: std of net acceleration (throttle - brake) across the horizon.                                      
+        # This directly penalises abrupt changes in longitudinal force.                                             
+        net_accel = actions[:, 0] - actions[:, 2]                                                                   
+        jerk = float(np.std(net_accel))
 
         return (
             cfg.W_LANE_CENTER  * lat_err +
@@ -276,23 +293,36 @@ class CriticCost:
     ) -> float:
         """
         For each timestep, compute minimum distance between ego and every actor.
-        Apply exponential penalty for distances below DANGER_RADIUS.
+        Apply exponential penalty for distances below DANGER_RADIUS, scaled by
+        a directional weight: forward actors (cos²θ near 1) cost up to 2×;
+        pure-side actors (cosθ near 0) cost 0.25× — reduces lateral overreaction.
         """
-        cfg   = self.cfg
-        total = 0.0
+        cfg    = self.cfg
+        total  = 0.0
 
+        ego_x0, ego_y0, ego_yaw0 = ego_traj[0]
         ego_xy = ego_traj[1:, :2]   # (H, 2) — skip step 0 (current)
 
         for traj in predictions.values():
-            # traj: (H, 3) — actor predicted positions
             H = min(ego_xy.shape[0], traj.shape[0])
             dists = np.linalg.norm(ego_xy[:H] - traj[:H, :2], axis=1)  # (H,)
             min_d = dists.min()
 
             if min_d < cfg.DANGER_RADIUS:
-                # Exponential cost: peaks at 0 m, ~1.0 at COLLISION_RADIUS
+                # Directional weight: project actor bearing onto ego forward axis.
+                # cos²θ gives 1.0 dead-ahead, 0.0 pure-side, smooth and always ≥ 0.
+                # We remap to [0.25, 2.0] so side actors still register but matter less.
+                ax, ay = traj[0, 0], traj[0, 1]
+                dx, dy = ax - ego_x0, ay - ego_y0
+                dist0  = math.hypot(dx, dy)
+                if dist0 > 0.1:
+                    cos_sq = ((dx * math.cos(ego_yaw0) + dy * math.sin(ego_yaw0)) / dist0) ** 2
+                else:
+                    cos_sq = 1.0
+                dir_weight = 0.1 + 1.9 * cos_sq  # range [0.1, 2.0] — side actors nearly ignored
+
                 risk = math.exp(-min_d / max(cfg.COLLISION_RADIUS, 0.1))
-                total += cfg.W_COLLISION * risk
+                total += cfg.W_COLLISION * risk * dir_weight
 
         return total
 
@@ -308,10 +338,11 @@ class CostModule:
         actions: np.ndarray,
         waypoint,
         current_speed: float,
+        desired_speed: float,
         predictions: dict,
     ) -> float:
         return (
-            self.intrinsic.compute_trajectory(ego_traj, actions, waypoint, current_speed) +
+            self.intrinsic.compute_trajectory(ego_traj, actions, waypoint, current_speed, desired_speed) +
             self.critic.compute_trajectory(ego_traj, predictions)
         )
 
@@ -340,13 +371,16 @@ class Policy:
         # Simple P-gain — clamp to [-1, 1]
         return float(np.clip(err * 0.6, -1.0, 1.0))
 
-    def sample(self, ego_frame: EgoFrame, waypoint=None) -> np.ndarray:
+    def sample(self, ego_frame: EgoFrame, waypoint=None, desired_speed: float = None) -> np.ndarray:
         N = self.cfg.MPPI_SAMPLES
         H = self.cfg.PREDICTION_HORIZON
         σ = self.cfg.MPPI_NOISE_STD
 
+        if desired_speed is None:                                                                                   
+            desired_speed = self.cfg.FREE_CRUISE_SPEED                                                              
+    
         speed = math.hypot(ego_frame.velocity.x, ego_frame.velocity.y)
-        error = self.cfg.TARGET_SPEED - speed
+        error = desired_speed - speed 
         raw   = self.cfg.SPEED_KP * error
         nominal_throttle = float(np.clip( raw, 0.0, 1.0))
         nominal_brake    = float(np.clip(-raw, 0.0, 1.0))
@@ -357,7 +391,7 @@ class Policy:
         # Wider steer noise to properly explore lateral avoidance manoeuvres
         noise = np.zeros((N, H, 3))
         noise[:, :, 0] = np.random.randn(N, H) * σ          # throttle
-        noise[:, :, 1] = np.random.randn(N, H) * (σ * 3.0)  # steer — wider range
+        noise[:, :, 1] = np.random.randn(N, H) * (σ * 1.0)  # steer — matched to throttle/brake noise
         noise[:, :, 2] = np.random.randn(N, H) * σ          # brake
 
         candidates = base + noise
@@ -383,6 +417,7 @@ class Optimizer:
         ego_frame: EgoFrame,
         waypoint,
         predictions: dict,
+        desired_speed: float, 
     ) -> carla.VehicleControl:
         cfg   = self.cfg
         lam   = cfg.MPPI_LAMBDA
@@ -393,7 +428,7 @@ class Optimizer:
         for i, actions in enumerate(candidates):
             ego_traj = _simulate_ego_trajectory(ego_frame, actions, dt)
             costs[i] = self.cost.trajectory_cost(
-                ego_traj, actions, waypoint, speed, predictions
+                ego_traj, actions, waypoint, speed, desired_speed, predictions 
             )
 
         beta    = costs.min()
@@ -469,14 +504,160 @@ def emergency_override(
 
 
 # ---------------------------------------------------------------------------
-# 9. Actor
+# 9. Control Smoother
+# ---------------------------------------------------------------------------
+
+class ControlSmoother:
+    """
+    Exponential moving average on net-accel (throttle - brake) and steer.
+    Prevents sudden lurches by blending the new command with the previous one.
+    Re-sync to raw values when the emergency layer overrides MPPI output so
+    the EMA state doesn't fight against emergency corrections.
+    """
+    def __init__(self, alpha_accel: float, alpha_steer: float):
+        self.alpha_accel = alpha_accel
+        self.alpha_steer = alpha_steer
+        self._net_accel  = 0.0
+        self._steer      = 0.0
+
+    def smooth(
+        self,
+        control: carla.VehicleControl,
+        emergency: bool = False,
+    ) -> carla.VehicleControl:
+        raw_net = control.throttle - control.brake
+
+        if emergency:
+            # Snap EMA state to the emergency values to avoid windup.
+            self._net_accel = raw_net
+            self._steer     = control.steer
+            return control
+
+        self._net_accel = self.alpha_accel * raw_net + (1.0 - self.alpha_accel) * self._net_accel
+        self._steer     = self.alpha_steer * control.steer + (1.0 - self.alpha_steer) * self._steer
+
+        net      = float(np.clip(self._net_accel, -1.0, 1.0))
+        throttle = float(np.clip( net, 0.0, 1.0))
+        brake    = float(np.clip(-net, 0.0, 1.0))
+        steer    = float(np.clip(self._steer, -1.0, 1.0))
+        return carla.VehicleControl(throttle=throttle, steer=steer, brake=brake, hand_brake=False)
+
+
+# ---------------------------------------------------------------------------
+# 10. Actor
 # ---------------------------------------------------------------------------
 
 class Actor:
     def __init__(self, cost_module: CostModule, cfg: type = Configurator):
         self.policy    = Policy(cfg)
         self.optimizer = Optimizer(cost_module, cfg)
+        self.smoother  = ControlSmoother(cfg.SMOOTH_ACCEL_ALPHA, cfg.SMOOTH_STEER_ALPHA)
         self.cfg       = cfg
+
+    def _desired_speed(self, ego_frame: EgoFrame, actor_frames: list, waypoint) -> float:
+        """
+        Dynamic speed target.
+
+        Lane weight: actors laterally offset beyond LANE_WIDTH_HALF from the ego's
+        lane center fade to zero influence, so normal traffic in adjacent lanes does
+        not trigger braking. Weight goes 1.0 (inside lane) → 0.0 (at 2× LANE_WIDTH_HALF).
+
+        Cone weight: soft directional falloff beyond CLEAR_CONE half-angle.
+
+        combined = lane_weight × cone_weight is applied to both the effective-distance
+        shrinkage and the stopped/in-gap speed caps so only actors genuinely in our
+        path matter.
+
+        In-gap moving cap: if any same-lane actor is inside SAFE_STOP_GAP regardless
+        of whether it is stopped, desired speed is capped to actor_speed + a small
+        headroom proportional to available gap. This handles actors that re-start
+        after a stop while still inside the safety zone.
+        """
+        cfg       = self.cfg
+        ego_yaw   = math.radians(ego_frame.transform.rotation.yaw)
+        ego_x     = ego_frame.location.x
+        ego_y     = ego_frame.location.y
+        ego_spd   = math.hypot(ego_frame.velocity.x, ego_frame.velocity.y)
+        half_cone = math.radians(cfg.CLEAR_CONE)
+
+        # Lane lateral normal from waypoint (used for lane-offset computation)
+        if waypoint is not None:
+            wp_yaw   = math.radians(waypoint.transform.rotation.yaw)
+            lane_nx  = -math.sin(wp_yaw)   # lateral normal (left of forward)
+            lane_ny  =  math.cos(wp_yaw)
+            wp_x     = waypoint.transform.location.x
+            wp_y     = waypoint.transform.location.y
+        else:
+            lane_nx, lane_ny = None, None
+
+        min_eff_dist = cfg.CLEAR_HORIZON
+        speed_cap    = cfg.FREE_CRUISE_SPEED   # lowered by stopped or in-gap actors
+
+        for actor in actor_frames:
+            dx   = actor.location.x - ego_x
+            dy   = actor.location.y - ego_y
+            dist = math.hypot(dx, dy)
+            if dist >= cfg.CLEAR_HORIZON:
+                continue
+
+            angle_to  = math.atan2(dy, dx)
+            rel_angle = (angle_to - ego_yaw + math.pi) % (2 * math.pi) - math.pi
+            abs_rel   = abs(rel_angle)
+
+            if abs_rel >= 2.0 * half_cone:
+                continue
+            cone_weight = (1.0 if abs_rel < half_cone else
+                           math.cos((abs_rel - half_cone) / half_cone * math.pi / 2) ** 2)
+
+            # Lane weight: lateral offset of actor from ego lane center.
+            if lane_nx is not None:
+                adx = actor.location.x - wp_x
+                ady = actor.location.y - wp_y
+                lat_offset = abs(adx * lane_nx + ady * lane_ny)
+                # 1.0 inside lane, linear fade to 0.0 at 2× LANE_WIDTH_HALF
+                lane_weight = max(0.0, 1.0 - lat_offset / (2.0 * cfg.LANE_WIDTH_HALF))
+            else:
+                lane_weight = 1.0
+
+            combined = cone_weight * lane_weight
+            if combined < 0.05:   # actor is clearly in another lane — skip
+                continue
+
+            if dist > 0.1:
+                ux, uy = dx / dist, dy / dist
+            else:
+                ux, uy = 1.0, 0.0
+
+            actor_spd_along = actor.velocity.x * ux + actor.velocity.y * uy
+            ego_spd_along   = ego_spd * math.cos(rel_angle)
+            closing_speed   = max(0.0, ego_spd_along - actor_spd_along)
+
+            eff_dist = max(0.0, dist - cfg.CLOSING_SPEED_GAIN * closing_speed * combined)
+            # Blend eff_dist toward CLEAR_HORIZON for off-lane actors so they barely
+            # affect the cruise speed.
+            blended_eff = combined * eff_dist + (1.0 - combined) * cfg.CLEAR_HORIZON
+            min_eff_dist = min(min_eff_dist, blended_eff)
+
+            # Speed caps apply only to actors solidly in our lane (combined > 0.5)
+            if combined > 0.5 and dist < cfg.SAFE_STOP_GAP:
+                actor_speed = math.hypot(actor.velocity.x, actor.velocity.y)
+
+                if actor_speed < cfg.STOP_ACTOR_SPEED:
+                    # Stopped actor: taper to 0 at STOP_DISTANCE
+                    gap_t = max(0.0, (dist - cfg.STOP_DISTANCE) /
+                                max(cfg.SAFE_STOP_GAP - cfg.STOP_DISTANCE, 0.1))
+                    speed_cap = min(speed_cap, cfg.FREE_CRUISE_SPEED * gap_t)
+                else:
+                    # Moving actor already inside the gap: cap to its speed plus a
+                    # small headroom so we decelerate to match rather than brake hard.
+                    gap_fraction = max(0.0, (dist - cfg.STOP_DISTANCE) /
+                                       max(cfg.SAFE_STOP_GAP - cfg.STOP_DISTANCE, 0.1))
+                    headroom  = cfg.FREE_CRUISE_SPEED * gap_fraction * 0.3
+                    speed_cap = min(speed_cap, actor_speed + headroom)
+
+        t = min_eff_dist / cfg.CLEAR_HORIZON
+        cruise_speed = cfg.MIN_FOLLOW_SPEED + t * (cfg.FREE_CRUISE_SPEED - cfg.MIN_FOLLOW_SPEED)
+        return min(cruise_speed, speed_cap)
 
     def act(
         self,
@@ -485,10 +666,14 @@ class Actor:
         predictions: dict,
         actor_frames: list,
     ) -> carla.VehicleControl:
-        candidates = self.policy.sample(ego_frame, waypoint)
-        control    = self.optimizer.optimize(candidates, ego_frame, waypoint, predictions)
-        control    = emergency_override(control, ego_frame, actor_frames, self.cfg)
-        return control
+        desired_speed   = self._desired_speed(ego_frame, actor_frames, waypoint)
+        candidates      = self.policy.sample(ego_frame, waypoint, desired_speed)
+        raw_control     = self.optimizer.optimize(candidates, ego_frame, waypoint, predictions, desired_speed)
+        after_emergency = emergency_override(raw_control, ego_frame, actor_frames, self.cfg)
+        is_emergency    = (after_emergency.brake != raw_control.brake or
+                           after_emergency.throttle != raw_control.throttle)
+        control = self.smoother.smooth(after_emergency, emergency=is_emergency)
+        return control, desired_speed
 
 
 # ---------------------------------------------------------------------------
@@ -627,12 +812,13 @@ def main():
             predictions  = world_model.predict()
             waypoint     = perception.current_waypoint
             actor_frames = stm.latest_actors()
-            control      = actor.act(ego_frame, waypoint, predictions, actor_frames)
+            control, desired_speed = actor.act(ego_frame, waypoint, predictions, actor_frames)
             ego.apply_control(control)
 
             speed = math.hypot(ego_frame.velocity.x, ego_frame.velocity.y)
             print(
                 f"[AD] speed={speed:.1f} m/s ({speed*3.6:.1f} km/h)  "
+                f"target={desired_speed:.1f} m/s  " 
                 f"throttle={control.throttle:.2f}  "
                 f"brake={control.brake:.2f}  "
                 f"steer={control.steer:.3f}  "
