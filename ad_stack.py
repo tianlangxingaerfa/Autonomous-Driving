@@ -32,20 +32,45 @@ class Configurator:
 
     # Ego vehicle
     VEHICLE_BLUEPRINT  = "vehicle.tesla.model3"                                                                      
-    FREE_CRUISE_SPEED  = 20.0   # m/s (~43 km/h) — target on a clear road
+    FREE_CRUISE_SPEED  = 12.0   # m/s (~43 km/h) — ceiling on a clear road
     MIN_FOLLOW_SPEED   = 0.0    # m/s — allow full stop behind a stopped actor
     CLEAR_HORIZON      = 30.0   # m — beyond this, ahead is considered clear
-    CLEAR_CONE         = 20.0   # half-angle (deg) of forward clearance cone
+    CLEAR_CONE         = 35.0   # half-angle (deg) of forward clearance cone — wider catches side-clipping actors
     LANE_WIDTH_HALF    = 2.0    # m — actors beyond this lateral offset are treated as other-lane
-    CLOSING_SPEED_GAIN = 1.0    # seconds of closing-speed lookahead (reduced: less aggressive at distance)
+    CLOSING_SPEED_GAIN = 1.0    # seconds of closing-speed lookahead
     SAFE_STOP_GAP      = 15.0   # m — start tapering speed toward 0 when stopped actor is within this range
     STOP_DISTANCE      = 8.0    # m — centroid-to-centroid target gap (~4.7 m vehicle + 3.3 m clear space)
     STOP_ACTOR_SPEED   = 1.0    # m/s — actor speed below which we treat it as stopped
-    SPEED_KP           = 0.5
 
-    # Control smoothing (EMA)                                                                                        
-    SMOOTH_ACCEL_ALPHA = 0.35   # EMA weight for net-accel; lower = smoother                                         
-    SMOOTH_STEER_ALPHA = 0.45   # EMA weight for steer
+    # Longitudinal control: throttle is capped at CRUISE_THROTTLE_MAX so the car
+    # never lurches to full throttle regardless of how large the speed error is.
+    # The rate limiter (MAX_ACCEL_RATE) then smooths even this capped value.
+    CRUISE_THROTTLE_MAX = 0.45  # maximum allowed throttle during normal cruise
+    SPEED_KP_ACCEL      = 0.08  # throttle ∝ (speed_ceiling - speed); capped above
+    SPEED_KP_BRAKE      = 0.45  # brake ∝ (speed - speed_ceiling); higher = tighter stop
+
+    # Control smoothing (EMA) — higher alpha = faster response (less lag)
+    SMOOTH_ACCEL_ALPHA = 0.20
+    SMOOTH_STEER_ALPHA = 0.45   # raised: EMA must keep up with the higher rate limit
+
+    # Hard rate limits per tick (dt = 0.05 s, 20 Hz).
+    #   MAX_ACCEL_RATE 0.020/tick × 20 Hz × 4 m/s² = 1.6 m/s³  (gentle jerk)
+    #   MAX_STEER_RATE 0.120/tick × 20 Hz            = 2.4 steer-unit/s  (responsive for sharp turns)
+    MAX_ACCEL_RATE = 0.020
+    MAX_STEER_RATE = 0.120
+
+    # Steering geometry
+    STEER_K_CURVE   = 0.40
+    STEER_K_YAW     = 0.50
+    STEER_K_CTE     = 1.20   # stronger centering — was 0.80; rate limiter above allows it
+    STEER_SPEED_EPS = 2.0
+    STANLEY_LOOKAHEAD = 10.0
+
+    # Curve speed limit: when the road-curvature yaw-change over the lookahead
+    # distance exceeds CURVE_YAW_THRESH (rad), cap speed to CURVE_SPEED_MAX.
+    # This reduces lateral inertia so the CTE correction can hold the lane on turns.
+    CURVE_YAW_THRESH = 0.12   # rad (~7°) over 10 m lookahead — any noticeable bend
+    CURVE_SPEED_MAX  = 7.0    # m/s (~25 km/h) on curves
 
     # STM
     STM_BUFFER_LEN = 20
@@ -68,17 +93,35 @@ class Configurator:
     CAMERA_VIEW = "third_person"
 
     # Traffic
-    NPC_VEHICLES = 100
+    NPC_VEHICLES = 40
     NPC_WALKERS  = 50
 
     # Optimizer (MPPI)
-    MPPI_SAMPLES    = 128      # more samples → better coverage
-    MPPI_LAMBDA     = 0.5      # lower temperature → sharper selection
-    MPPI_NOISE_STD  = 0.15     # perturbation on throttle/steer
+    MPPI_LAMBDA          = 0.5   # temperature: lower = sharper selection
+
+    # Structured candidate grid (replaces random noise).
+    # On a clear road: single deterministic action (no grid needed).
+    # Near obstacles: throttle/brake varied over a grid of N_THROTTLE × N_BRAKE
+    # values and steer held at the nominal value.  This removes tick-to-tick
+    # randomness — same state always produces the same candidate set.
+    MPPI_N_THROTTLE = 9    # throttle levels: linspace(0, CRUISE_THROTTLE_MAX, N)
+    MPPI_N_BRAKE    = 9    # brake levels:    linspace(0, 1, N)
+    # Total candidates = N_THROTTLE × N_BRAKE = 81 (fast, deterministic)
 
     # Emergency reactive layer
     EMERGENCY_DIST  = 6.0      # m — trigger hard brake + steer
-    EMERGENCY_CONE  = 25.0     # half-angle (deg) — narrowed to stop overreacting to side actors
+    EMERGENCY_CONE  = 35.0     # half-angle (deg) — matches CLEAR_CONE so side-clip actors are caught
+
+    # Clear-road threshold: if no actor is within this distance in the forward cone,
+    # skip MPPI entirely and apply the deterministic nominal action directly.
+    # This eliminates all stochastic shiver on an unobstructed road.
+    CLEAR_ROAD_DIST = 20.0     # m
+
+    # Traffic-light compliance
+    TL_STOP_LINE_DIST    = 30.0   # m — how far ahead to look for a controlling light
+    TL_YELLOW_SPEED_CAP  = 3.0    # m/s — final creep speed on yellow
+    TL_TAPER_START       = 25.0   # m from stop point — begin smooth taper
+    TL_STOP_BUFFER       = 12.0   # m — car should rest this far before the stop-waypoint
 
 
 # ---------------------------------------------------------------------------
@@ -126,12 +169,110 @@ class ShortTermMemory:
 # ---------------------------------------------------------------------------
 
 class Perception:
+    """
+    Perception tick.
+
+    Waypoint tracking strategy (fixes passive lane-change bug):
+      carla.Map.get_waypoint(location) re-snaps to the geometrically nearest lane
+      every tick.  When the ego drifts toward a lane boundary, the snap jumps to the
+      adjacent lane, inverts the CTE sign, and drives the car further into that lane
+      — a positive-feedback oscillation that eventually produces an unintended lane
+      change.
+
+      Instead we maintain a *tracked* waypoint that only advances *forward* along the
+      current lane's road graph.  We advance it whenever the ego passes beyond its
+      position (dot-product test), and we never jump laterally.  A lateral re-anchor
+      is only allowed on a hard reset (vehicle teleport / first tick).
+    """
+
+    # How far ahead of the current waypoint the lookahead target should sit.
+    _LOOKAHEAD_DIST = Configurator.STANLEY_LOOKAHEAD
+    # Advance the tracked waypoint in small steps along the graph.
+    _ADVANCE_STEP   = 1.5   # m per graph walk step — finer for smoother curves
+    # How far behind the ego the tracked waypoint is allowed to lag.
+    # Keep small so CTE is measured against the correct lane direction after a turn.
+    _MAX_LAG        = 2.0   # m
+
     def __init__(self, world: carla.World, ego_vehicle: carla.Vehicle, stm: ShortTermMemory):
-        self.world       = world
-        self.ego_vehicle = ego_vehicle
-        self.stm         = stm
-        self.carla_map   = world.get_map()
-        self.current_waypoint = None
+        self.world            = world
+        self.ego_vehicle      = ego_vehicle
+        self.stm              = stm
+        self.carla_map        = world.get_map()
+        self.current_waypoint  = None
+        self.lookahead_waypoint = None
+        self._tracked_wp       = None   # forward-only tracked waypoint
+        self._approach_wp      = None   # last non-junction waypoint — used for TL matching
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _advance_tracker(self, ego_x: float, ego_y: float):
+        """
+        Walk the tracked waypoint forward along the lane graph until it is
+        at most _MAX_LAG metres behind the ego.
+
+        Also maintains _approach_wp: the last waypoint that was NOT inside a
+        junction.  Its road_id / lane_id are used for traffic-light matching so
+        that the correct stop-waypoints are found even after the ego has already
+        entered the intersection.
+        """
+        wp = self._tracked_wp
+        if wp is None:
+            return
+
+        for _ in range(80):
+            wp_x  = wp.transform.location.x
+            wp_y  = wp.transform.location.y
+            fwd_x = math.cos(math.radians(wp.transform.rotation.yaw))
+            fwd_y = math.sin(math.radians(wp.transform.rotation.yaw))
+            along = (ego_x - wp_x) * fwd_x + (ego_y - wp_y) * fwd_y
+            if along < self._MAX_LAG:
+                break
+            nexts = wp.next(self._ADVANCE_STEP)
+            if not nexts:
+                break
+            if not wp.is_junction:
+                same = [n for n in nexts
+                        if n.road_id == wp.road_id and n.lane_id == wp.lane_id]
+                wp = same[0] if same else nexts[0]
+            else:
+                wp = nexts[0]
+
+        self._tracked_wp = wp
+        # Keep _approach_wp pointing at the last non-junction waypoint.
+        if not wp.is_junction:
+            self._approach_wp = wp
+        elif self._approach_wp is None:
+            self._approach_wp = wp
+
+    def _build_lookahead(self) -> "carla.Waypoint":
+        """
+        Walk from the tracked waypoint forward _LOOKAHEAD_DIST m.
+        Follows the road graph freely through junctions so the heading reference
+        curves along the turn arc rather than freezing at the junction entry.
+        """
+        wp = self._tracked_wp
+        if wp is None:
+            return None
+        remaining = self._LOOKAHEAD_DIST
+        while remaining > 0.0:
+            nexts = wp.next(min(remaining, self._ADVANCE_STEP))
+            if not nexts:
+                break
+            # Same logic: stay on lane on normal road, free walk inside junction
+            if not wp.is_junction:
+                same = [n for n in nexts
+                        if n.road_id == wp.road_id and n.lane_id == wp.lane_id]
+                wp = same[0] if same else nexts[0]
+            else:
+                wp = nexts[0]
+            remaining -= self._ADVANCE_STEP
+        return wp
+
+    # ------------------------------------------------------------------
+    # Public tick
+    # ------------------------------------------------------------------
 
     def tick(self):
         ego = self.ego_vehicle
@@ -141,6 +282,68 @@ class Perception:
         acc = ego.get_acceleration()
 
         ego_frame = EgoFrame(loc, vel, acc, tf)
+
+        # ---- Traffic-light state ----
+        tl_state = carla.TrafficLightState.Unknown
+        tl_dist  = float("inf")   # distance to the relevant stop-line (m)
+
+        if ego.is_at_traffic_light():
+            tl = ego.get_traffic_light()
+            if tl is not None:
+                tl_state = tl.get_state()
+                # Use _approach_wp for road+lane: _tracked_wp may already be inside
+                # the junction where its road_id no longer matches stop-waypoints.
+                ref_wp   = self._approach_wp or self._tracked_wp
+                ego_road = ref_wp.road_id if ref_wp else -1
+                ego_lane = ref_wp.lane_id if ref_wp else 0
+                best_stop_dist = float("inf")
+                for swp in tl.get_stop_waypoints():
+                    if swp.road_id != ego_road or swp.lane_id != ego_lane:
+                        continue
+                    d = math.hypot(swp.transform.location.x - loc.x,
+                                   swp.transform.location.y - loc.y)
+                    best_stop_dist = min(best_stop_dist, d)
+                tl_dist = best_stop_dist if best_stop_dist < float("inf") else 0.0
+        elif self._approach_wp is not None:
+            # Wide look-ahead scan: use the approach road+lane for matching so
+            # left-turn pre-junction detection works correctly.
+            ref_wp    = self._approach_wp
+            ego_road  = ref_wp.road_id
+            ego_lane  = ref_wp.lane_id
+            ego_yaw   = math.radians(tf.rotation.yaw)
+            fwd_x     = math.cos(ego_yaw)
+            fwd_y     = math.sin(ego_yaw)
+
+            best_dist      = Configurator.TL_STOP_LINE_DIST
+            best_state     = carla.TrafficLightState.Unknown
+            best_stop_dist = float("inf")
+
+            for tl in self.world.get_actors().filter("traffic.traffic_light*"):
+                tl_loc = tl.get_location()
+                dx = tl_loc.x - loc.x
+                dy = tl_loc.y - loc.y
+                dist = math.hypot(dx, dy)
+                if dist >= best_dist:
+                    continue
+                if dx * fwd_x + dy * fwd_y <= 0:
+                    continue
+                matched_stop_dist = float("inf")
+                for swp in tl.get_stop_waypoints():
+                    if swp.road_id == ego_road and swp.lane_id == ego_lane:
+                        d = math.hypot(swp.transform.location.x - loc.x,
+                                       swp.transform.location.y - loc.y)
+                        matched_stop_dist = min(matched_stop_dist, d)
+                if matched_stop_dist == float("inf"):
+                    continue
+                best_dist      = dist
+                best_state     = tl.get_state()
+                best_stop_dist = matched_stop_dist
+
+            tl_state = best_state
+            tl_dist  = best_stop_dist if best_state != carla.TrafficLightState.Unknown else float("inf")
+
+        ego_frame.traffic_light_state = tl_state
+        ego_frame.traffic_light_dist  = tl_dist
 
         actor_list = []
         for actor in self.world.get_actors():
@@ -155,7 +358,15 @@ class Perception:
             a_bb  = actor.bounding_box
             actor_list.append(ActorFrame(actor.id, a_loc, a_vel, a_bb))
 
-        self.current_waypoint = self.carla_map.get_waypoint(loc)
+        # ---- Waypoint tracking ----
+        if self._tracked_wp is None:
+            # First tick or hard reset: anchor to the actual nearest waypoint.
+            self._tracked_wp = self.carla_map.get_waypoint(loc)
+
+        self._advance_tracker(loc.x, loc.y)
+        self.current_waypoint   = self._tracked_wp
+        self.lookahead_waypoint = self._build_lookahead()
+
         self.stm.push(ego_frame, actor_list)
 
 
@@ -243,6 +454,7 @@ class IntrinsicCost:
         waypoint,
         current_speed: float,
         desired_speed: float,
+        tl_must_stop: bool = False,  # True when ego is obligated to stop (red/yellow)
     ) -> float:
         cfg = self.cfg
 
@@ -270,15 +482,25 @@ class IntrinsicCost:
         estimated_speed = max(0.0, current_speed + (mean_throttle - mean_brake) * 4.0 * actions.shape[0] * 0.05)
         speed_err = abs(estimated_speed - desired_speed) 
 
-        # Jerk: std of net acceleration (throttle - brake) across the horizon.                                      
-        # This directly penalises abrupt changes in longitudinal force.                                             
-        net_accel = actions[:, 0] - actions[:, 2]                                                                   
+        # Jerk: std of net acceleration (throttle - brake) across the horizon.
+        # This directly penalises abrupt changes in longitudinal force.
+        net_accel = actions[:, 0] - actions[:, 2]
         jerk = float(np.std(net_accel))
+
+        # Traffic-rule penalty: when a red/yellow light requires stopping, any
+        # candidate that still carries throttle is penalised proportionally.
+        # This makes the cost-minimising candidate always prefer brake over throttle
+        # at a red light, reinforcing the hard speed-ceiling applied upstream.
+        traffic_penalty = 0.0
+        if tl_must_stop:
+            mean_throttle_penalty = float(np.mean(actions[:, 0]))
+            traffic_penalty = cfg.W_TRAFFIC_RULE * mean_throttle_penalty
 
         return (
             cfg.W_LANE_CENTER  * lat_err +
             cfg.W_SPEED_TRACK  * speed_err +
-            cfg.W_COMFORT_JERK * jerk
+            cfg.W_COMFORT_JERK * jerk +
+            traffic_penalty
         )
 
 
@@ -340,9 +562,11 @@ class CostModule:
         current_speed: float,
         desired_speed: float,
         predictions: dict,
+        tl_must_stop: bool = False,
     ) -> float:
         return (
-            self.intrinsic.compute_trajectory(ego_traj, actions, waypoint, current_speed, desired_speed) +
+            self.intrinsic.compute_trajectory(
+                ego_traj, actions, waypoint, current_speed, desired_speed, tl_must_stop) +
             self.critic.compute_trajectory(ego_traj, predictions)
         )
 
@@ -359,49 +583,94 @@ class Policy:
     def __init__(self, cfg: type = Configurator):
         self.cfg = cfg
 
-    def _nominal_steer(self, ego_frame: EgoFrame, waypoint) -> float:
-        """Stanley-style heading error to waypoint."""
+    def _nominal_steer(self, ego_frame: EgoFrame, waypoint, lookahead_wp=None) -> float:
+        """
+        Three-term decomposed steering — only steers when the road actually demands it.
+
+        Term 1 — Road curvature (feedforward):
+          Δyaw = (lookahead_wp.yaw − current_wp.yaw) normalised to [−π, π].
+          This is the arc the road will turn through over the lookahead distance.
+          On a perfectly straight road Δyaw≈0, so this term outputs ≈0 with no
+          ego-yaw noise feeding through.
+
+        Term 2 — Heading alignment (small correction):
+          Compares ego yaw to the *current* waypoint yaw.  Uses the on-graph waypoint,
+          not the ego itself, so map-yaw noise is ≪ ego IMU noise.  Small gain keeps
+          corrections gentle.
+
+        Term 3 — Cross-track centering (tiny restoring force):
+          Signed lateral offset of ego from the current waypoint centre-line.
+          Very small gain + speed softening → near-zero on a straight with small CTE.
+          The rate limiter in ControlSmoother prevents this from oscillating.
+        """
         if waypoint is None:
             return 0.0
-        wp_yaw  = math.radians(waypoint.transform.rotation.yaw)
+        cfg = self.cfg
+
+        # ── Term 1: feedforward curvature ──────────────────────────────────
+        ref_wp = lookahead_wp if lookahead_wp is not None else waypoint
+        wp_yaw_cur  = math.radians(waypoint.transform.rotation.yaw)
+        wp_yaw_look = math.radians(ref_wp.transform.rotation.yaw)
+        road_curve  = (wp_yaw_look - wp_yaw_cur + math.pi) % (2 * math.pi) - math.pi
+        curvature_steer = cfg.STEER_K_CURVE * road_curve
+
+        # ── Term 2: heading alignment ───────────────────────────────────────
         ego_yaw = math.radians(ego_frame.transform.rotation.yaw)
-        err = wp_yaw - ego_yaw
-        # Normalise to [-pi, pi]
-        err = (err + math.pi) % (2 * math.pi) - math.pi
-        # Simple P-gain — clamp to [-1, 1]
-        return float(np.clip(err * 0.6, -1.0, 1.0))
+        heading_err = (wp_yaw_cur - ego_yaw + math.pi) % (2 * math.pi) - math.pi
+        heading_steer = cfg.STEER_K_YAW * heading_err
 
-    def sample(self, ego_frame: EgoFrame, waypoint=None, desired_speed: float = None) -> np.ndarray:
-        N = self.cfg.MPPI_SAMPLES
-        H = self.cfg.PREDICTION_HORIZON
-        σ = self.cfg.MPPI_NOISE_STD
+        # ── Term 3: cross-track centering ───────────────────────────────────
+        wp_loc = waypoint.transform.location
+        # CARLA left-handed (Y south). Right-of-heading at yaw θ: (−sin θ, +cos θ).
+        # Verify: θ=0 (East) → (0, +1) = South = right ✓; θ=90 (South) → (−1, 0) = West = right ✓
+        # Left-of-heading = sign-flip = (+sin θ, −cos θ).
+        # cte > 0 → ego is LEFT of centre → need positive steer (right) to return ✓
+        lat_nx =  math.sin(wp_yaw_cur)
+        lat_ny = -math.cos(wp_yaw_cur)
+        dx = ego_frame.location.x - wp_loc.x
+        dy = ego_frame.location.y - wp_loc.y
+        cte = dx * lat_nx + dy * lat_ny
+        v   = max(0.0, math.hypot(ego_frame.velocity.x, ego_frame.velocity.y))
+        cte_steer = math.atan2(cfg.STEER_K_CTE * cte, v + cfg.STEER_SPEED_EPS)
 
-        if desired_speed is None:                                                                                   
-            desired_speed = self.cfg.FREE_CRUISE_SPEED                                                              
-    
-        speed = math.hypot(ego_frame.velocity.x, ego_frame.velocity.y)
-        error = desired_speed - speed 
-        raw   = self.cfg.SPEED_KP * error
-        nominal_throttle = float(np.clip( raw, 0.0, 1.0))
-        nominal_brake    = float(np.clip(-raw, 0.0, 1.0))
-        nominal_steer    = self._nominal_steer(ego_frame, waypoint)
+        raw = curvature_steer + heading_steer + cte_steer
+        return float(np.clip(raw, -1.0, 1.0))
 
-        base  = np.tile([nominal_throttle, nominal_steer, nominal_brake], (N, H, 1))
+    def sample(self, ego_frame: EgoFrame, waypoint=None, speed_ceiling: float = None,
+               lookahead_wp=None) -> np.ndarray:
+        """
+        Build a deterministic structured candidate set.
 
-        # Wider steer noise to properly explore lateral avoidance manoeuvres
-        noise = np.zeros((N, H, 3))
-        noise[:, :, 0] = np.random.randn(N, H) * σ          # throttle
-        noise[:, :, 1] = np.random.randn(N, H) * (σ * 1.0)  # steer — matched to throttle/brake noise
-        noise[:, :, 2] = np.random.randn(N, H) * σ          # brake
+        The nominal steer is always used for every candidate — steering is handled
+        by the deterministic controller, not by the optimiser.  Only throttle and
+        brake are varied, over a fixed grid so the same state always produces
+        identical candidates (no tick-to-tick randomness).
 
-        candidates = base + noise
-        candidates[:, :, 0] = np.clip(candidates[:, :, 0], 0.0,  1.0)
-        candidates[:, :, 1] = np.clip(candidates[:, :, 1], -1.0, 1.0)
-        candidates[:, :, 2] = np.clip(candidates[:, :, 2], 0.0,  1.0)
+        Grid: N_THROTTLE throttle levels × N_BRAKE brake levels, replicated over
+        the prediction horizon H.  Candidates where both throttle and brake are
+        high are pruned (mutual exclusion) to avoid physically nonsensical actions.
+        """
+        cfg = self.cfg
+        H   = cfg.PREDICTION_HORIZON
 
-        # Mutual exclusion: if brake > 0.1 zero throttle (and vice versa)
-        heavy_brake = candidates[:, :, 2] > 0.1
-        candidates[:, :, 0][heavy_brake] = 0.0
+        if speed_ceiling is None:
+            speed_ceiling = cfg.FREE_CRUISE_SPEED
+
+        nominal_steer = self._nominal_steer(ego_frame, waypoint, lookahead_wp)
+
+        throttle_vals = np.linspace(0.0, cfg.CRUISE_THROTTLE_MAX, cfg.MPPI_N_THROTTLE)
+        brake_vals    = np.linspace(0.0, 1.0,                      cfg.MPPI_N_BRAKE)
+
+        rows = []
+        for t in throttle_vals:
+            for b in brake_vals:
+                if t > 0.05 and b > 0.1:
+                    continue   # mutually exclusive — skip
+                # Each candidate holds this action constant across the horizon
+                action = np.array([t, nominal_steer, b], dtype=np.float32)
+                rows.append(np.tile(action, (H, 1)))
+
+        candidates = np.stack(rows, axis=0)   # (N, H, 3)
         return candidates
 
 
@@ -417,7 +686,8 @@ class Optimizer:
         ego_frame: EgoFrame,
         waypoint,
         predictions: dict,
-        desired_speed: float, 
+        speed_ceiling: float,
+        tl_must_stop: bool = False,
     ) -> carla.VehicleControl:
         cfg   = self.cfg
         lam   = cfg.MPPI_LAMBDA
@@ -428,22 +698,20 @@ class Optimizer:
         for i, actions in enumerate(candidates):
             ego_traj = _simulate_ego_trajectory(ego_frame, actions, dt)
             costs[i] = self.cost.trajectory_cost(
-                ego_traj, actions, waypoint, speed, desired_speed, predictions 
+                ego_traj, actions, waypoint, speed, speed_ceiling, predictions, tl_must_stop
             )
 
         beta    = costs.min()
         weights = np.exp(-(costs - beta) / lam)
         weights /= weights.sum()
 
-        first_actions = candidates[:, 0, :]          # (N, 3)
+        first_actions = candidates[:, 0, :]
         best_action   = (weights[:, None] * first_actions).sum(axis=0)
 
-        throttle = float(np.clip(best_action[0], 0.0,  1.0))
+        throttle = float(np.clip(best_action[0], 0.0, cfg.CRUISE_THROTTLE_MAX))
         steer    = float(np.clip(best_action[1], -1.0, 1.0))
         brake    = float(np.clip(best_action[2], 0.0,  1.0))
 
-        # Mutual exclusion at output: MPPI averaging always blends both non-zero.
-        # CARLA physics treats any brake > 0 as holding the vehicle from rest.
         if throttle >= brake:
             brake = 0.0
         else:
@@ -463,16 +731,23 @@ def emergency_override(
     cfg: type = Configurator,
 ) -> carla.VehicleControl:
     """
-    If an obstacle is within EMERGENCY_DIST in the forward cone, override
-    with hard brake and steer away. Bypasses MPPI for immediate response.
+    Hard reactive layer for imminent collisions inside EMERGENCY_DIST.
+
+    Directional response policy:
+      - Forward obstacle (|rel_angle| < 15°): brake hard + light steer-away blend.
+      - Lateral obstacle (15° ≤ |rel_angle| < EMERGENCY_CONE): brake only — steering
+        into a side-actor tends to make things worse; slowing down creates separation.
+      - The steer-away magnitude scales with the forward fraction (cos²) so the
+        transition is smooth across the cone rather than a binary switch.
     """
-    ego_yaw = math.radians(ego_frame.transform.rotation.yaw)
-    ego_x   = ego_frame.location.x
-    ego_y   = ego_frame.location.y
+    ego_yaw   = math.radians(ego_frame.transform.rotation.yaw)
+    ego_x     = ego_frame.location.x
+    ego_y     = ego_frame.location.y
     half_cone = math.radians(cfg.EMERGENCY_CONE)
 
     closest_dist  = float("inf")
     steer_away    = 0.0
+    steer_weight  = 0.0   # how much steer-away to mix in (0 for pure-lateral threats)
 
     for actor in actor_frames:
         dx = actor.location.x - ego_x
@@ -481,21 +756,36 @@ def emergency_override(
         if dist > cfg.EMERGENCY_DIST or dist < 0.5:
             continue
 
-        # Angle of obstacle relative to ego heading
-        angle_to = math.atan2(dy, dx)
+        angle_to  = math.atan2(dy, dx)
         rel_angle = (angle_to - ego_yaw + math.pi) % (2 * math.pi) - math.pi
 
-        if abs(rel_angle) < half_cone:
-            if dist < closest_dist:
-                closest_dist = dist
-                # Steer away from the obstacle's lateral side
-                steer_away = -math.copysign(1.0, rel_angle) * min(1.0, (cfg.EMERGENCY_DIST - dist) / cfg.EMERGENCY_DIST * 2.0)
+        if abs(rel_angle) >= half_cone:
+            continue
+
+        if dist < closest_dist:
+            closest_dist = dist
+
+            # cos² gives 1.0 dead-ahead, 0.0 pure-side; remap to [0, 1] steer weight
+            cos_sq = math.cos(rel_angle) ** 2
+            steer_weight = cos_sq   # pure lateral → 0, pure forward → 1
+
+            # Steer-away direction (only applied proportionally to steer_weight)
+            candidate_steer = -math.copysign(1.0, rel_angle) * min(
+                1.0, (cfg.EMERGENCY_DIST - dist) / cfg.EMERGENCY_DIST * 2.0
+            )
+            steer_away = candidate_steer
 
     if closest_dist < cfg.EMERGENCY_DIST:
         brake_strength = float(np.clip(1.0 - closest_dist / cfg.EMERGENCY_DIST, 0.3, 1.0))
+        # Blend steer-away only for forward-ish threats; lateral threats get 0 steer change
+        blended_steer = float(np.clip(
+            steer_weight * (steer_away * 0.5 + control.steer * 0.5) +
+            (1.0 - steer_weight) * control.steer,
+            -1.0, 1.0,
+        ))
         return carla.VehicleControl(
             throttle=0.0,
-            steer=float(np.clip(steer_away * 0.7 + control.steer * 0.3, -1.0, 1.0)),
+            steer=blended_steer,
             brake=brake_strength,
             hand_brake=False,
         )
@@ -509,16 +799,21 @@ def emergency_override(
 
 class ControlSmoother:
     """
-    Exponential moving average on net-accel (throttle - brake) and steer.
-    Prevents sudden lurches by blending the new command with the previous one.
-    Re-sync to raw values when the emergency layer overrides MPPI output so
-    the EMA state doesn't fight against emergency corrections.
+    Two-stage smoothing pipeline:
+      1. Exponential moving average (EMA) — removes high-frequency noise.
+      2. Hard rate limiter — caps the per-tick change after EMA so the signal
+         never jumps faster than a physical jerk budget allows.
+
+    Emergency signals bypass the EMA and snap state, preventing windup.
     """
-    def __init__(self, alpha_accel: float, alpha_steer: float):
-        self.alpha_accel = alpha_accel
-        self.alpha_steer = alpha_steer
-        self._net_accel  = 0.0
-        self._steer      = 0.0
+    def __init__(self, alpha_accel: float, alpha_steer: float,
+                 max_accel_rate: float, max_steer_rate: float):
+        self.alpha_accel    = alpha_accel
+        self.alpha_steer    = alpha_steer
+        self.max_accel_rate = max_accel_rate
+        self.max_steer_rate = max_steer_rate
+        self._net_accel     = 0.0
+        self._steer         = 0.0
 
     def smooth(
         self,
@@ -528,19 +823,35 @@ class ControlSmoother:
         raw_net = control.throttle - control.brake
 
         if emergency:
-            # Snap EMA state to the emergency values to avoid windup.
             self._net_accel = raw_net
             self._steer     = control.steer
             return control
 
-        self._net_accel = self.alpha_accel * raw_net + (1.0 - self.alpha_accel) * self._net_accel
-        self._steer     = self.alpha_steer * control.steer + (1.0 - self.alpha_steer) * self._steer
+        # --- Stage 1: EMA ---
+        ema_net   = self.alpha_accel * raw_net       + (1.0 - self.alpha_accel) * self._net_accel
+        ema_steer = self.alpha_steer * control.steer + (1.0 - self.alpha_steer) * self._steer
 
-        net      = float(np.clip(self._net_accel, -1.0, 1.0))
+        # --- Stage 2: rate limiter ---
+        net   = float(np.clip(ema_net,
+                              self._net_accel - self.max_accel_rate,
+                              self._net_accel + self.max_accel_rate))
+        steer = float(np.clip(ema_steer,
+                              self._steer - self.max_steer_rate,
+                              self._steer + self.max_steer_rate))
+
+        # Commit the rate-limited values as new EMA state so the next step's
+        # rate window is anchored to what we actually sent, not what EMA wanted.
+        self._net_accel = net
+        self._steer     = steer
+
+        net   = float(np.clip(net,   -1.0, 1.0))
+        steer = float(np.clip(steer, -1.0, 1.0))
+
         throttle = float(np.clip( net, 0.0, 1.0))
         brake    = float(np.clip(-net, 0.0, 1.0))
-        steer    = float(np.clip(self._steer, -1.0, 1.0))
         return carla.VehicleControl(throttle=throttle, steer=steer, brake=brake, hand_brake=False)
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -551,27 +862,74 @@ class Actor:
     def __init__(self, cost_module: CostModule, cfg: type = Configurator):
         self.policy    = Policy(cfg)
         self.optimizer = Optimizer(cost_module, cfg)
-        self.smoother  = ControlSmoother(cfg.SMOOTH_ACCEL_ALPHA, cfg.SMOOTH_STEER_ALPHA)
-        self.cfg       = cfg
+        self.smoother  = ControlSmoother(
+            cfg.SMOOTH_ACCEL_ALPHA, cfg.SMOOTH_STEER_ALPHA,
+            cfg.MAX_ACCEL_RATE,     cfg.MAX_STEER_RATE,
+        )
+        self.cfg = cfg
 
-    def _desired_speed(self, ego_frame: EgoFrame, actor_frames: list, waypoint) -> float:
+    # ------------------------------------------------------------------
+
+    def _road_is_clear(self, ego_frame: EgoFrame, actor_frames: list) -> bool:
         """
-        Dynamic speed target.
+        True when no actor is within CLEAR_ROAD_DIST in the forward cone.
+        On a clear road we skip MPPI and apply the deterministic nominal action,
+        eliminating all stochastic shiver.
+        """
+        cfg       = self.cfg
+        ego_yaw   = math.radians(ego_frame.transform.rotation.yaw)
+        ego_x     = ego_frame.location.x
+        ego_y     = ego_frame.location.y
+        half_cone = math.radians(cfg.CLEAR_CONE)
 
-        Lane weight: actors laterally offset beyond LANE_WIDTH_HALF from the ego's
-        lane center fade to zero influence, so normal traffic in adjacent lanes does
-        not trigger braking. Weight goes 1.0 (inside lane) → 0.0 (at 2× LANE_WIDTH_HALF).
+        for actor in actor_frames:
+            dx   = actor.location.x - ego_x
+            dy   = actor.location.y - ego_y
+            dist = math.hypot(dx, dy)
+            if dist >= cfg.CLEAR_ROAD_DIST:
+                continue
+            angle_to  = math.atan2(dy, dx)
+            rel_angle = (angle_to - ego_yaw + math.pi) % (2 * math.pi) - math.pi
+            if abs(rel_angle) < half_cone:
+                return False
+        return True
 
-        Cone weight: soft directional falloff beyond CLEAR_CONE half-angle.
+    def _nominal_control(
+        self,
+        ego_frame: EgoFrame,
+        waypoint,
+        lookahead_wp,
+        speed_ceiling: float,
+    ) -> carla.VehicleControl:
+        """
+        Deterministic control used on a clear road (no MPPI noise).
+        Throttle is proportional to the gap between current speed and the ceiling,
+        capped at CRUISE_THROTTLE_MAX so the car never lunges to full throttle.
+        Brake is proportional to overspeed.
+        """
+        nominal_steer = self.policy._nominal_steer(ego_frame, waypoint, lookahead_wp)
+        speed     = math.hypot(ego_frame.velocity.x, ego_frame.velocity.y)
+        err_accel = max(0.0, speed_ceiling - speed)
+        err_brake = max(0.0, speed - speed_ceiling)
+        throttle  = float(np.clip(self.cfg.SPEED_KP_ACCEL * err_accel, 0.0, self.cfg.CRUISE_THROTTLE_MAX))
+        brake     = float(np.clip(self.cfg.SPEED_KP_BRAKE  * err_brake, 0.0, 1.0))
+        if throttle >= brake:
+            brake = 0.0
+        else:
+            throttle = 0.0
+        return carla.VehicleControl(throttle=throttle, steer=nominal_steer,
+                                    brake=brake, hand_brake=False)
 
-        combined = lane_weight × cone_weight is applied to both the effective-distance
-        shrinkage and the stopped/in-gap speed caps so only actors genuinely in our
-        path matter.
+    def _speed_ceiling(self, ego_frame: EgoFrame, actor_frames: list, waypoint) -> float:
+        """
+        Returns a hard speed ceiling set by road clearance ahead.
 
-        In-gap moving cap: if any same-lane actor is inside SAFE_STOP_GAP regardless
-        of whether it is stopped, desired speed is capped to actor_speed + a small
-        headroom proportional to available gap. This handles actors that re-start
-        after a stop while still inside the safety zone.
+        On a completely clear road this returns FREE_CRUISE_SPEED.
+        As the closest same-lane actor closes in, the ceiling drops continuously
+        toward zero using a distance-proportional taper.  The controller then
+        simply drives up to (but never beyond) this ceiling — no separate target,
+        no EMA on the target value.  The rate limiter on the throttle output
+        already prevents abrupt accelerations.
         """
         cfg       = self.cfg
         ego_yaw   = math.radians(ego_frame.transform.rotation.yaw)
@@ -665,15 +1023,54 @@ class Actor:
         waypoint,
         predictions: dict,
         actor_frames: list,
+        lookahead_wp=None,
     ) -> carla.VehicleControl:
-        desired_speed   = self._desired_speed(ego_frame, actor_frames, waypoint)
-        candidates      = self.policy.sample(ego_frame, waypoint, desired_speed)
-        raw_control     = self.optimizer.optimize(candidates, ego_frame, waypoint, predictions, desired_speed)
+        # ── Traffic-light compliance ────────────────────────────────────────
+        tl_state = getattr(ego_frame, 'traffic_light_state',
+                           carla.TrafficLightState.Unknown)
+        tl_red    = (tl_state == carla.TrafficLightState.Red)
+        tl_yellow = (tl_state == carla.TrafficLightState.Yellow)
+        tl_must_stop = tl_red or tl_yellow
+        tl_dist  = getattr(ego_frame, 'traffic_light_dist', float("inf"))
+
+        speed_ceil = self._speed_ceiling(ego_frame, actor_frames, waypoint)
+
+        # ── Curve speed limit ──────────────────────────────────────────────
+        # Reduce speed on bends so lateral inertia doesn't push the car off-centre.
+        if waypoint is not None and lookahead_wp is not None:
+            wp_yaw_cur  = math.radians(waypoint.transform.rotation.yaw)
+            wp_yaw_look = math.radians(lookahead_wp.transform.rotation.yaw)
+            road_curve  = abs((wp_yaw_look - wp_yaw_cur + math.pi) % (2 * math.pi) - math.pi)
+            if road_curve > self.cfg.CURVE_YAW_THRESH:
+                speed_ceil = min(speed_ceil, self.cfg.CURVE_SPEED_MAX)
+
+        # ── Traffic-light gradual taper ────────────────────────────────────
+        if tl_red or tl_yellow:
+            buf        = self.cfg.TL_STOP_BUFFER
+            target_spd = 0.0 if tl_red else self.cfg.TL_YELLOW_SPEED_CAP
+            d_eff      = max(0.0, tl_dist - buf)
+
+            if d_eff <= 0.0:
+                tl_ceil = target_spd
+            elif d_eff < self.cfg.TL_TAPER_START:
+                frac    = d_eff / self.cfg.TL_TAPER_START
+                tl_ceil = target_spd + frac * (self.cfg.FREE_CRUISE_SPEED - target_spd)
+            else:
+                tl_ceil = self.cfg.FREE_CRUISE_SPEED
+            speed_ceil = min(speed_ceil, tl_ceil)
+
+        if self._road_is_clear(ego_frame, actor_frames) and not tl_must_stop:
+            raw_control = self._nominal_control(ego_frame, waypoint, lookahead_wp, speed_ceil)
+        else:
+            candidates  = self.policy.sample(ego_frame, waypoint, speed_ceil, lookahead_wp)
+            raw_control = self.optimizer.optimize(
+                candidates, ego_frame, waypoint, predictions, speed_ceil, tl_must_stop)
+
         after_emergency = emergency_override(raw_control, ego_frame, actor_frames, self.cfg)
         is_emergency    = (after_emergency.brake != raw_control.brake or
                            after_emergency.throttle != raw_control.throttle)
         control = self.smoother.smooth(after_emergency, emergency=is_emergency)
-        return control, desired_speed
+        return control, speed_ceil
 
 
 # ---------------------------------------------------------------------------
@@ -732,13 +1129,44 @@ def spawn_npc_walkers(client: carla.Client, world: carla.World, n: int) -> tuple
 # Helper: update spectator camera
 # ---------------------------------------------------------------------------
 
-def update_spectator(spectator: carla.Actor, ego_tf: carla.Transform, mode: str):
-    loc = ego_tf.location
-    yaw = ego_tf.rotation.yaw
+class CameraFilter:
+    """
+    Smooths only the spectator yaw in complex-number space (handles ±180° wrap).
+    Position is tracked exactly — any EMA lag on position creates a constant
+    camera-to-vehicle offset that teleports by tiny amounts every tick, which
+    CARLA renders as shimmer even when the car is stopped.
+    """
+    def __init__(self, alpha_yaw: float = 0.04):
+        self.alpha_yaw = alpha_yaw
+        self._cos = None
+        self._sin = None
+
+    def update(self, ego_tf: carla.Transform) -> tuple:
+        """Returns (x, y, z, smoothed_yaw_deg) with exact position, smooth yaw."""
+        loc     = ego_tf.location
+        yaw_rad = math.radians(ego_tf.rotation.yaw)
+        c, s    = math.cos(yaw_rad), math.sin(yaw_rad)
+
+        if self._cos is None:
+            self._cos, self._sin = c, s
+        else:
+            b         = self.alpha_yaw
+            rc        = b * c + (1 - b) * self._cos
+            rs        = b * s + (1 - b) * self._sin
+            n         = math.hypot(rc, rs)
+            self._cos = rc / n
+            self._sin = rs / n
+
+        return loc.x, loc.y, loc.z, math.degrees(math.atan2(self._sin, self._cos))
+
+
+def update_spectator(spectator: carla.Actor, cam: CameraFilter,
+                     ego_tf: carla.Transform, mode: str):
+    x, y, z, yaw = cam.update(ego_tf)
 
     if mode == "bird":
         cam_tf = carla.Transform(
-            carla.Location(x=loc.x, y=loc.y, z=loc.z + 30.0),
+            carla.Location(x=x, y=y, z=z + 30.0),
             carla.Rotation(pitch=-90.0, yaw=yaw, roll=0.0),
         )
     else:
@@ -746,7 +1174,7 @@ def update_spectator(spectator: carla.Actor, ego_tf: carla.Transform, mode: str)
         offset_x = -8.0 * math.cos(rad)
         offset_y = -8.0 * math.sin(rad)
         cam_tf   = carla.Transform(
-            carla.Location(x=loc.x + offset_x, y=loc.y + offset_y, z=loc.z + 4.0),
+            carla.Location(x=x + offset_x, y=y + offset_y, z=z + 4.0),
             carla.Rotation(pitch=-15.0, yaw=yaw, roll=0.0),
         )
 
@@ -792,6 +1220,7 @@ def main():
     print(f"[AD] Spawned ego vehicle id={ego.id} at {ego.get_location()}")
 
     spectator   = world.get_spectator()
+    cam_filter  = CameraFilter()
     stm         = ShortTermMemory()
     perception  = Perception(world, ego, stm)
     world_model = WorldModel(stm)
@@ -807,18 +1236,21 @@ def main():
             if ego_frame is None:
                 continue
 
-            update_spectator(spectator, ego_frame.transform, cfg.CAMERA_VIEW)
+            update_spectator(spectator, cam_filter, ego_frame.transform, cfg.CAMERA_VIEW)
 
             predictions  = world_model.predict()
             waypoint     = perception.current_waypoint
+            lookahead_wp = perception.lookahead_waypoint
             actor_frames = stm.latest_actors()
-            control, desired_speed = actor.act(ego_frame, waypoint, predictions, actor_frames)
+            control, speed_ceil = actor.act(ego_frame, waypoint, predictions, actor_frames, lookahead_wp)
             ego.apply_control(control)
 
             speed = math.hypot(ego_frame.velocity.x, ego_frame.velocity.y)
+            tl_state = getattr(ego_frame, 'traffic_light_state', carla.TrafficLightState.Unknown)
             print(
                 f"[AD] speed={speed:.1f} m/s ({speed*3.6:.1f} km/h)  "
-                f"target={desired_speed:.1f} m/s  " 
+                f"ceiling={speed_ceil:.1f} m/s  "
+                f"tl={tl_state}  "
                 f"throttle={control.throttle:.2f}  "
                 f"brake={control.brake:.2f}  "
                 f"steer={control.steer:.3f}  "
