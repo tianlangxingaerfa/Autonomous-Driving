@@ -31,8 +31,8 @@ class Configurator:
     FIXED_DELTA_SECONDS = 0.05  # 20 Hz
 
     # Ego vehicle
-    VEHICLE_BLUEPRINT  = "vehicle.tesla.model3"                                                                      
-    FREE_CRUISE_SPEED  = 12.0   # m/s (~43 km/h) — ceiling on a clear road
+    VEHICLE_BLUEPRINT  = "vehicle.tesla.model3"
+    FREE_CRUISE_SPEED  = 20.0   # m/s — fallback ceiling when no pace controller is active
     MIN_FOLLOW_SPEED   = 0.0    # m/s — allow full stop behind a stopped actor
     CLEAR_HORIZON      = 30.0   # m — beyond this, ahead is considered clear
     CLEAR_CONE         = 35.0   # half-angle (deg) of forward clearance cone — wider catches side-clipping actors
@@ -55,8 +55,10 @@ class Configurator:
 
     # Hard rate limits per tick (dt = 0.05 s, 20 Hz).
     #   MAX_ACCEL_RATE 0.020/tick × 20 Hz × 4 m/s² = 1.6 m/s³  (gentle jerk)
+    #   MAX_BRAKE_RATE 0.08 /tick × 20 Hz            = much faster braking response
     #   MAX_STEER_RATE 0.120/tick × 20 Hz            = 2.4 steer-unit/s  (responsive for sharp turns)
     MAX_ACCEL_RATE = 0.020
+    MAX_BRAKE_RATE = 0.080   # braking is asymmetrically faster than acceleration
     MAX_STEER_RATE = 0.120
 
     # Steering geometry
@@ -118,10 +120,30 @@ class Configurator:
     CLEAR_ROAD_DIST = 20.0     # m
 
     # Traffic-light compliance
-    TL_STOP_LINE_DIST    = 30.0   # m — how far ahead to look for a controlling light
+    TL_STOP_LINE_DIST    = 60.0   # m — how far ahead to look for a controlling light
     TL_YELLOW_SPEED_CAP  = 3.0    # m/s — final creep speed on yellow
-    TL_TAPER_START       = 25.0   # m from stop point — begin smooth taper
-    TL_STOP_BUFFER       = 12.0   # m — car should rest this far before the stop-waypoint
+    TL_TAPER_START       = 50.0   # m from stop point — begin smooth taper
+    TL_STOP_BUFFER       = 1.0    # m — centroid rests this far before the stop-waypoint
+    TL_RIGHT_TURN_YAW    = 0.40   # rad (~23°) signed yaw change → treat as right turn, skip TL
+
+    # Lap-pace controller
+    # The pace controller computes a desired cruise speed = remaining_dist / remaining_time
+    # so the car arrives at the lap end within LAP_TARGET_TIME seconds regardless of
+    # how long it was held behind traffic or at red lights.
+    # Hard bounds keep the target inside a safe range; safety layers (obstacles,
+    # traffic lights, curves, emergency) are always applied on top of this.
+    LAP_DISTANCE     = 700.0   # m — estimated circuit length (tune per map)
+    LAP_TARGET_TIME  = 45.0   # s — desired lap duration
+    PACE_SPEED_MIN   = 6.0     # m/s — never command below this on a clear road
+    PACE_SPEED_MAX   = 22.0    # m/s — absolute speed ceiling the pace controller may request
+    LAP_CLOSE_RADIUS = 5.0    # m — within this radius of spawn → lap is closed
+
+    # Lane change
+    LC_BEHIND_CLEAR  = 6.0   # m — min gap behind in target lane before changing
+    LC_AHEAD_CLEAR   = 6.0   # m — min gap ahead  in target lane before changing
+    LC_SLOW_THRESH   = 0.70   # fraction of pace target — lane-ahead actor below this triggers LC desire
+    LC_COMMIT_TICKS  = 60     # ticks (~3 s) to hold the new lane before re-evaluating
+    LC_BLOCKED_TICKS = 40     # ticks to wait after a blocked attempt before retrying
 
 
 # ---------------------------------------------------------------------------
@@ -137,11 +159,12 @@ class EgoFrame:
 
 
 class ActorFrame:
-    def __init__(self, actor_id, location, velocity, bounding_box):
+    def __init__(self, actor_id, location, velocity, bounding_box, is_vehicle: bool = True):
         self.actor_id     = actor_id
         self.location     = location
         self.velocity     = velocity
         self.bounding_box = bounding_box
+        self.is_vehicle   = is_vehicle
 
 
 class ShortTermMemory:
@@ -202,6 +225,7 @@ class Perception:
         self.lookahead_waypoint = None
         self._tracked_wp       = None   # forward-only tracked waypoint
         self._approach_wp      = None   # last non-junction waypoint — used for TL matching
+        self._pinned_stop_loc  = None   # committed stop-line XY (set once, cleared on green)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -287,23 +311,43 @@ class Perception:
         tl_state = carla.TrafficLightState.Unknown
         tl_dist  = float("inf")   # distance to the relevant stop-line (m)
 
+        # Helper: find the stop-waypoint distance on the ego's lane for a given TL.
+        def _stop_dist_for_tl(tl, road_id, lane_id):
+            best = float("inf")
+            best_loc = None
+            for swp in tl.get_stop_waypoints():
+                if swp.road_id != road_id or swp.lane_id != lane_id:
+                    continue
+                d = math.hypot(swp.transform.location.x - loc.x,
+                               swp.transform.location.y - loc.y)
+                if d < best:
+                    best = d
+                    best_loc = swp.transform.location
+            return best, best_loc
+
         if ego.is_at_traffic_light():
             tl = ego.get_traffic_light()
             if tl is not None:
                 tl_state = tl.get_state()
-                # Use _approach_wp for road+lane: _tracked_wp may already be inside
-                # the junction where its road_id no longer matches stop-waypoints.
                 ref_wp   = self._approach_wp or self._tracked_wp
                 ego_road = ref_wp.road_id if ref_wp else -1
                 ego_lane = ref_wp.lane_id if ref_wp else 0
-                best_stop_dist = float("inf")
-                for swp in tl.get_stop_waypoints():
-                    if swp.road_id != ego_road or swp.lane_id != ego_lane:
-                        continue
-                    d = math.hypot(swp.transform.location.x - loc.x,
-                                   swp.transform.location.y - loc.y)
-                    best_stop_dist = min(best_stop_dist, d)
-                tl_dist = best_stop_dist if best_stop_dist < float("inf") else 0.0
+
+                if tl_state in (carla.TrafficLightState.Red, carla.TrafficLightState.Yellow):
+                    # Pin the stop location on the first red/yellow tick.
+                    if self._pinned_stop_loc is None:
+                        raw_d, raw_loc = _stop_dist_for_tl(tl, ego_road, ego_lane)
+                        if raw_loc is not None:
+                            self._pinned_stop_loc = raw_loc
+                else:
+                    self._pinned_stop_loc = None
+
+                if self._pinned_stop_loc is not None:
+                    tl_dist = math.hypot(self._pinned_stop_loc.x - loc.x,
+                                         self._pinned_stop_loc.y - loc.y)
+                else:
+                    raw_d, _ = _stop_dist_for_tl(tl, ego_road, ego_lane)
+                    tl_dist = raw_d if raw_d < float("inf") else 0.0
         elif self._approach_wp is not None:
             # Wide look-ahead scan: use the approach road+lane for matching so
             # left-turn pre-junction detection works correctly.
@@ -317,6 +361,7 @@ class Perception:
             best_dist      = Configurator.TL_STOP_LINE_DIST
             best_state     = carla.TrafficLightState.Unknown
             best_stop_dist = float("inf")
+            best_stop_loc  = None
 
             for tl in self.world.get_actors().filter("traffic.traffic_light*"):
                 tl_loc = tl.get_location()
@@ -327,20 +372,27 @@ class Perception:
                     continue
                 if dx * fwd_x + dy * fwd_y <= 0:
                     continue
-                matched_stop_dist = float("inf")
-                for swp in tl.get_stop_waypoints():
-                    if swp.road_id == ego_road and swp.lane_id == ego_lane:
-                        d = math.hypot(swp.transform.location.x - loc.x,
-                                       swp.transform.location.y - loc.y)
-                        matched_stop_dist = min(matched_stop_dist, d)
-                if matched_stop_dist == float("inf"):
+                raw_d, raw_loc = _stop_dist_for_tl(tl, ego_road, ego_lane)
+                if raw_loc is None:
                     continue
                 best_dist      = dist
                 best_state     = tl.get_state()
-                best_stop_dist = matched_stop_dist
+                best_stop_dist = raw_d
+                best_stop_loc  = raw_loc
 
             tl_state = best_state
-            tl_dist  = best_stop_dist if best_state != carla.TrafficLightState.Unknown else float("inf")
+            if best_state in (carla.TrafficLightState.Red, carla.TrafficLightState.Yellow):
+                # Pin as soon as we detect a red/yellow ahead.
+                if self._pinned_stop_loc is None and best_stop_loc is not None:
+                    self._pinned_stop_loc = best_stop_loc
+                if self._pinned_stop_loc is not None:
+                    tl_dist = math.hypot(self._pinned_stop_loc.x - loc.x,
+                                         self._pinned_stop_loc.y - loc.y)
+                else:
+                    tl_dist = best_stop_dist
+            else:
+                self._pinned_stop_loc = None
+                tl_dist = float("inf")
 
         ego_frame.traffic_light_state = tl_state
         ego_frame.traffic_light_dist  = tl_dist
@@ -356,7 +408,8 @@ class Perception:
                 continue
             a_vel = actor.get_velocity()
             a_bb  = actor.bounding_box
-            actor_list.append(ActorFrame(actor.id, a_loc, a_vel, a_bb))
+            actor_list.append(ActorFrame(actor.id, a_loc, a_vel, a_bb,
+                                         is_vehicle=isinstance(actor, carla.Vehicle)))
 
         # ---- Waypoint tracking ----
         if self._tracked_wp is None:
@@ -803,14 +856,18 @@ class ControlSmoother:
       1. Exponential moving average (EMA) — removes high-frequency noise.
       2. Hard rate limiter — caps the per-tick change after EMA so the signal
          never jumps faster than a physical jerk budget allows.
+         Braking uses a separate (faster) rate limit so late-detected stops
+         can react quickly without making normal acceleration jerky.
 
     Emergency signals bypass the EMA and snap state, preventing windup.
     """
     def __init__(self, alpha_accel: float, alpha_steer: float,
-                 max_accel_rate: float, max_steer_rate: float):
+                 max_accel_rate: float, max_steer_rate: float,
+                 max_brake_rate: float = None):
         self.alpha_accel    = alpha_accel
         self.alpha_steer    = alpha_steer
         self.max_accel_rate = max_accel_rate
+        self.max_brake_rate = max_brake_rate if max_brake_rate is not None else max_accel_rate
         self.max_steer_rate = max_steer_rate
         self._net_accel     = 0.0
         self._steer         = 0.0
@@ -831,9 +888,15 @@ class ControlSmoother:
         ema_net   = self.alpha_accel * raw_net       + (1.0 - self.alpha_accel) * self._net_accel
         ema_steer = self.alpha_steer * control.steer + (1.0 - self.alpha_steer) * self._steer
 
-        # --- Stage 2: rate limiter ---
+        # --- Stage 2: asymmetric rate limiter ---
+        # Braking (net going more negative) uses max_brake_rate for fast response.
+        # Accelerating (net going more positive) uses max_accel_rate for smooth onset.
+        if ema_net < self._net_accel:
+            rate = self.max_brake_rate
+        else:
+            rate = self.max_accel_rate
         net   = float(np.clip(ema_net,
-                              self._net_accel - self.max_accel_rate,
+                              self._net_accel - rate,
                               self._net_accel + self.max_accel_rate))
         steer = float(np.clip(ema_steer,
                               self._steer - self.max_steer_rate,
@@ -855,7 +918,254 @@ class ControlSmoother:
 
 
 # ---------------------------------------------------------------------------
-# 10. Actor
+# 10. Lap Pace Controller
+# ---------------------------------------------------------------------------
+
+class LapPaceController:
+    """
+    Time-to-target cruise speed governor.
+
+    Each tick it computes:
+
+        pace_speed = remaining_distance / remaining_time
+
+    clamped to [PACE_SPEED_MIN, PACE_SPEED_MAX].  Safety layers (obstacles,
+    TL, curves, emergency) always take priority — this only sets the *desired*
+    open-road ceiling.
+
+    Odometry: we integrate velocity magnitude every tick (dt = FIXED_DELTA_SECONDS).
+    Lap closure: when the ego comes within LAP_CLOSE_RADIUS of the spawn location
+    and has already travelled > LAP_DISTANCE / 2 (so the start-line crossing at
+    the very beginning doesn't count), the lap counter increments, elapsed/odometer
+    reset, and a new lap begins.
+
+    The pace_speed smoothly rises when the car falls behind schedule (remaining
+    dist / remaining time > current speed) and falls when it is ahead of schedule,
+    so it acts like a gentle I-term that absorbs stops at traffic lights without
+    any discontinuous jumps.
+    """
+
+    def __init__(self, spawn_location, cfg: type = Configurator,
+                 dt: float = Configurator.FIXED_DELTA_SECONDS):
+        self.cfg            = cfg
+        self.dt             = dt
+        self.spawn_loc      = spawn_location   # carla.Location at start of first lap
+        self.lap_count      = 0
+        self._odometer      = 0.0   # metres travelled this lap
+        self._elapsed       = 0.0   # seconds elapsed this lap
+        self._lap_started   = False  # True once we have moved away from spawn
+        self._away          = False  # True once we are > LAP_CLOSE_RADIUS from spawn
+
+    # ------------------------------------------------------------------
+
+    def tick(self, ego_frame: EgoFrame) -> float:
+        """
+        Update state and return the desired cruise speed (m/s) for this tick.
+        """
+        cfg  = self.cfg
+        speed = math.hypot(ego_frame.velocity.x, ego_frame.velocity.y)
+
+        # Accumulate odometry and time.
+        self._odometer += speed * self.dt
+        self._elapsed  += self.dt
+
+        # Lap-closure detection.
+        dist_to_spawn = math.hypot(
+            ego_frame.location.x - self.spawn_loc.x,
+            ego_frame.location.y - self.spawn_loc.y,
+        )
+        if not self._away and dist_to_spawn > cfg.LAP_CLOSE_RADIUS:
+            self._away = True   # we have left the start zone
+        if self._away and dist_to_spawn <= cfg.LAP_CLOSE_RADIUS:
+            # Only close the lap once we have covered at least half the expected
+            # circuit — guards against a false trigger at the very first tick.
+            if self._odometer > cfg.LAP_DISTANCE * 0.5:
+                self.lap_count  += 1
+                lap_time         = self._elapsed
+                print(f"[Pace] Lap {self.lap_count} complete — "
+                      f"{lap_time:.1f} s  "
+                      f"(target {cfg.LAP_TARGET_TIME:.0f} s)  "
+                      f"dist={self._odometer:.0f} m")
+                self._odometer = 0.0
+                self._elapsed  = 0.0
+                self._away     = False
+
+        # Compute pace speed.
+        remaining_dist = max(0.0, cfg.LAP_DISTANCE - self._odometer)
+        remaining_time = max(1.0, cfg.LAP_TARGET_TIME - self._elapsed)
+        pace = remaining_dist / remaining_time
+
+        return float(np.clip(pace, cfg.PACE_SPEED_MIN, cfg.PACE_SPEED_MAX))
+
+    @property
+    def odometer(self) -> float:
+        return self._odometer
+
+    @property
+    def elapsed(self) -> float:
+        return self._elapsed
+
+
+# ---------------------------------------------------------------------------
+# 11. Lane Changer
+# ---------------------------------------------------------------------------
+
+class LaneChanger:
+    """
+    Opportunistic lane-change logic.
+
+    Every tick the changer asks:
+      1. Is the current lane blocked by a slow *vehicle* ahead?
+      2. Is there an adjacent *same-direction* Driving lane whose waypoint
+         permits a lane change (lane_change flag) and that is not a junction?
+      3. Is that lane clear of *vehicles* (LC_BEHIND_CLEAR behind,
+         LC_AHEAD_CLEAR ahead)?
+
+    Walkers and cyclists are deliberately ignored — the emergency-brake layer
+    handles them; a lane change to dodge a pedestrian is unsafe and forbidden.
+
+    Left lane is tried first (faster overtake); right is the fallback.
+
+    Cooldowns prevent thrashing:
+      • After a successful change: LC_COMMIT_TICKS before re-evaluating.
+      • After a blocked attempt:   LC_BLOCKED_TICKS before retrying.
+
+    The changer never acts:
+      • Inside a junction.
+      • When a traffic light requires stopping.
+      • When the road-curve exceeds CURVE_YAW_THRESH.
+    """
+
+    def __init__(self, carla_map, cfg: type = Configurator):
+        self.map       = carla_map
+        self.cfg       = cfg
+        self._cooldown = 0
+
+    def _lane_clear(self, target_wp, actor_frames: list,
+                    ego_x: float, ego_y: float, ego_yaw: float) -> bool:
+        """Return True if target lane has enough vehicle gap ahead and behind."""
+        cfg     = self.cfg
+        fwd_x   = math.cos(ego_yaw)
+        fwd_y   = math.sin(ego_yaw)
+        tgt_yaw = math.radians(target_wp.transform.rotation.yaw)
+        lat_nx  = -math.sin(tgt_yaw)
+        lat_ny  =  math.cos(tgt_yaw)
+        tgt_x   = target_wp.transform.location.x
+        tgt_y   = target_wp.transform.location.y
+
+        for actor in actor_frames:
+            if not actor.is_vehicle:
+                continue   # walkers never block a lane-change clearance check
+            adx = actor.location.x - tgt_x
+            ady = actor.location.y - tgt_y
+            if abs(adx * lat_nx + ady * lat_ny) > cfg.LANE_WIDTH_HALF:
+                continue   # not in target lane
+            rdx   = actor.location.x - ego_x
+            rdy   = actor.location.y - ego_y
+            along = rdx * fwd_x + rdy * fwd_y
+            if 0 < along < cfg.LC_AHEAD_CLEAR:
+                return False
+            if along <= 0 and abs(along) < cfg.LC_BEHIND_CLEAR:
+                return False
+        return True
+
+    @staticmethod
+    def _same_direction(current_wp, neighbor_wp) -> bool:
+        """True when neighbor lane runs in the same traffic direction as current."""
+        # CARLA sign convention: positive lane_id = right of road centre,
+        # negative = left.  Lanes on the same side of the road (same sign)
+        # are same-direction; opposite signs mean counter-traffic.
+        return (current_wp.lane_id > 0) == (neighbor_wp.lane_id > 0)
+
+    def tick(
+        self,
+        perception,
+        ego_frame: EgoFrame,
+        actor_frames: list,
+        pace_speed: float,
+        tl_must_stop: bool,
+        road_curve: float,
+    ) -> bool:
+        cfg = self.cfg
+
+        if self._cooldown > 0:
+            self._cooldown -= 1
+            return False
+
+        current_wp = perception.current_waypoint
+        if current_wp is None or current_wp.is_junction:
+            return False
+        if tl_must_stop:
+            return False
+        if road_curve > cfg.CURVE_YAW_THRESH:
+            return False
+
+        ego_x   = ego_frame.location.x
+        ego_y   = ego_frame.location.y
+        ego_yaw = math.radians(ego_frame.transform.rotation.yaw)
+        fwd_x   = math.cos(ego_yaw)
+        fwd_y   = math.sin(ego_yaw)
+
+        # ── Is current lane blocked by a slow vehicle? ───────────────────
+        wp_yaw = math.radians(current_wp.transform.rotation.yaw)
+        lat_nx = -math.sin(wp_yaw)
+        lat_ny =  math.cos(wp_yaw)
+        wp_x   = current_wp.transform.location.x
+        wp_y   = current_wp.transform.location.y
+
+        lane_blocked = False
+        for actor in actor_frames:
+            if not actor.is_vehicle:
+                continue   # never trigger lane change for pedestrians/walkers
+            adx = actor.location.x - wp_x
+            ady = actor.location.y - wp_y
+            if abs(adx * lat_nx + ady * lat_ny) > cfg.LANE_WIDTH_HALF:
+                continue
+            rdx   = actor.location.x - ego_x
+            rdy   = actor.location.y - ego_y
+            along = rdx * fwd_x + rdy * fwd_y
+            if 0 < along < cfg.SAFE_STOP_GAP:
+                actor_spd = math.hypot(actor.velocity.x, actor.velocity.y)
+                if actor_spd < pace_speed * cfg.LC_SLOW_THRESH:
+                    lane_blocked = True
+                    break
+
+        if not lane_blocked:
+            return False
+
+        # ── Try left lane first, then right ──────────────────────────────
+        for get_neighbor, required_permission in (
+            (lambda wp: wp.get_left_lane(),  carla.LaneChange.Left),
+            (lambda wp: wp.get_right_lane(), carla.LaneChange.Right),
+        ):
+            nb = get_neighbor(current_wp)
+            if nb is None:
+                continue
+            if nb.lane_type != carla.LaneType.Driving:
+                continue   # no sidewalks, bike lanes, parking, etc.
+            if not self._same_direction(current_wp, nb):
+                continue   # never cross into oncoming traffic
+            if nb.is_junction:
+                continue
+            # Respect the map's lane-change permission markings.
+            allowed = current_wp.lane_change
+            if not (allowed == carla.LaneChange.Both or allowed == required_permission):
+                continue
+            if not self._lane_clear(nb, actor_frames, ego_x, ego_y, ego_yaw):
+                self._cooldown = cfg.LC_BLOCKED_TICKS
+                continue
+
+            # Execute: re-anchor tracker to adjacent lane centre-line.
+            perception._tracked_wp  = nb
+            perception._approach_wp = nb
+            self._cooldown = cfg.LC_COMMIT_TICKS
+            return True
+
+        return False
+
+
+# ---------------------------------------------------------------------------
+# 12. Actor
 # ---------------------------------------------------------------------------
 
 class Actor:
@@ -865,6 +1175,7 @@ class Actor:
         self.smoother  = ControlSmoother(
             cfg.SMOOTH_ACCEL_ALPHA, cfg.SMOOTH_STEER_ALPHA,
             cfg.MAX_ACCEL_RATE,     cfg.MAX_STEER_RATE,
+            max_brake_rate=cfg.MAX_BRAKE_RATE,
         )
         self.cfg = cfg
 
@@ -920,11 +1231,13 @@ class Actor:
         return carla.VehicleControl(throttle=throttle, steer=nominal_steer,
                                     brake=brake, hand_brake=False)
 
-    def _speed_ceiling(self, ego_frame: EgoFrame, actor_frames: list, waypoint) -> float:
+    def _speed_ceiling(self, ego_frame: EgoFrame, actor_frames: list, waypoint,
+                       open_road_speed: float = None) -> float:
         """
         Returns a hard speed ceiling set by road clearance ahead.
 
-        On a completely clear road this returns FREE_CRUISE_SPEED.
+        On a completely clear road this returns open_road_speed (the pace-controller
+        target, or FREE_CRUISE_SPEED when no pace controller is active).
         As the closest same-lane actor closes in, the ceiling drops continuously
         toward zero using a distance-proportional taper.  The controller then
         simply drives up to (but never beyond) this ceiling — no separate target,
@@ -932,6 +1245,8 @@ class Actor:
         already prevents abrupt accelerations.
         """
         cfg       = self.cfg
+        if open_road_speed is None:
+            open_road_speed = cfg.FREE_CRUISE_SPEED
         ego_yaw   = math.radians(ego_frame.transform.rotation.yaw)
         ego_x     = ego_frame.location.x
         ego_y     = ego_frame.location.y
@@ -949,7 +1264,7 @@ class Actor:
             lane_nx, lane_ny = None, None
 
         min_eff_dist = cfg.CLEAR_HORIZON
-        speed_cap    = cfg.FREE_CRUISE_SPEED   # lowered by stopped or in-gap actors
+        speed_cap    = open_road_speed   # lowered by stopped or in-gap actors
 
         for actor in actor_frames:
             dx   = actor.location.x - ego_x
@@ -1001,21 +1316,25 @@ class Actor:
                 actor_speed = math.hypot(actor.velocity.x, actor.velocity.y)
 
                 if actor_speed < cfg.STOP_ACTOR_SPEED:
-                    # Stopped actor: taper to 0 at STOP_DISTANCE
+                    # Stopped actor: taper to 0 at STOP_DISTANCE.
+                    # Use FREE_CRUISE_SPEED as the taper reference so the pace target
+                    # doesn't amplify the braking when we're running slow.
                     gap_t = max(0.0, (dist - cfg.STOP_DISTANCE) /
                                 max(cfg.SAFE_STOP_GAP - cfg.STOP_DISTANCE, 0.1))
                     speed_cap = min(speed_cap, cfg.FREE_CRUISE_SPEED * gap_t)
                 else:
-                    # Moving actor already inside the gap: cap to its speed plus a
-                    # small headroom so we decelerate to match rather than brake hard.
+                    # Moving actor: cap to its speed + small headroom.
                     gap_fraction = max(0.0, (dist - cfg.STOP_DISTANCE) /
                                        max(cfg.SAFE_STOP_GAP - cfg.STOP_DISTANCE, 0.1))
                     headroom  = cfg.FREE_CRUISE_SPEED * gap_fraction * 0.3
                     speed_cap = min(speed_cap, actor_speed + headroom)
 
         t = min_eff_dist / cfg.CLEAR_HORIZON
+        # Taper is computed against FREE_CRUISE_SPEED so that reducing
+        # open_road_speed (pace controller) never makes lateral/distant
+        # actors cause braking — it merely caps the top end.
         cruise_speed = cfg.MIN_FOLLOW_SPEED + t * (cfg.FREE_CRUISE_SPEED - cfg.MIN_FOLLOW_SPEED)
-        return min(cruise_speed, speed_cap)
+        return min(cruise_speed, speed_cap, open_road_speed)
 
     def act(
         self,
@@ -1024,16 +1343,33 @@ class Actor:
         predictions: dict,
         actor_frames: list,
         lookahead_wp=None,
+        cruise_target: float = None,
     ) -> carla.VehicleControl:
         # ── Traffic-light compliance ────────────────────────────────────────
         tl_state = getattr(ego_frame, 'traffic_light_state',
                            carla.TrafficLightState.Unknown)
         tl_red    = (tl_state == carla.TrafficLightState.Red)
         tl_yellow = (tl_state == carla.TrafficLightState.Yellow)
-        tl_must_stop = tl_red or tl_yellow
         tl_dist  = getattr(ego_frame, 'traffic_light_dist', float("inf"))
 
-        speed_ceil = self._speed_ceiling(ego_frame, actor_frames, waypoint)
+        # Right-turn exemption: in CARLA's left-handed coordinate system a
+        # clockwise (rightward) turn produces a positive signed yaw change.
+        # When the road ahead turns right by at least TL_RIGHT_TURN_YAW radians,
+        # the car may treat the intersection as a yield-and-proceed — TL compliance
+        # is disabled and only obstacle avoidance governs behaviour.
+        turning_right = False
+        if waypoint is not None and lookahead_wp is not None:
+            wp_yaw_cur  = math.radians(waypoint.transform.rotation.yaw)
+            wp_yaw_look = math.radians(lookahead_wp.transform.rotation.yaw)
+            signed_curve = (wp_yaw_look - wp_yaw_cur + math.pi) % (2 * math.pi) - math.pi
+            if signed_curve >= self.cfg.TL_RIGHT_TURN_YAW:
+                turning_right = True
+
+        tl_must_stop = (tl_red or tl_yellow) and not turning_right
+
+        # Use pace-controller target as the open-road ceiling; fall back to config.
+        open_road_speed = cruise_target if cruise_target is not None else self.cfg.FREE_CRUISE_SPEED
+        speed_ceil = self._speed_ceiling(ego_frame, actor_frames, waypoint, open_road_speed)
 
         # ── Curve speed limit ──────────────────────────────────────────────
         # Reduce speed on bends so lateral inertia doesn't push the car off-centre.
@@ -1044,8 +1380,8 @@ class Actor:
             if road_curve > self.cfg.CURVE_YAW_THRESH:
                 speed_ceil = min(speed_ceil, self.cfg.CURVE_SPEED_MAX)
 
-        # ── Traffic-light gradual taper ────────────────────────────────────
-        if tl_red or tl_yellow:
+        # ── Traffic-light gradual taper (skipped on right turns) ──────────
+        if (tl_red or tl_yellow) and not turning_right:
             buf        = self.cfg.TL_STOP_BUFFER
             target_spd = 0.0 if tl_red else self.cfg.TL_YELLOW_SPEED_CAP
             d_eff      = max(0.0, tl_dist - buf)
@@ -1070,6 +1406,7 @@ class Actor:
         is_emergency    = (after_emergency.brake != raw_control.brake or
                            after_emergency.throttle != raw_control.throttle)
         control = self.smoother.smooth(after_emergency, emergency=is_emergency)
+        ego_frame.turning_right = turning_right
         return control, speed_ceil
 
 
@@ -1224,8 +1561,10 @@ def main():
     stm         = ShortTermMemory()
     perception  = Perception(world, ego, stm)
     world_model = WorldModel(stm)
-    cost_module = CostModule(cfg)
-    actor       = Actor(cost_module, cfg)
+    cost_module  = CostModule(cfg)
+    actor_ctrl   = Actor(cost_module, cfg)
+    pace_ctrl    = LapPaceController(ego.get_location(), cfg)
+    lane_changer = LaneChanger(world.get_map(), cfg)
 
     try:
         while True:
@@ -1242,19 +1581,39 @@ def main():
             waypoint     = perception.current_waypoint
             lookahead_wp = perception.lookahead_waypoint
             actor_frames = stm.latest_actors()
-            control, speed_ceil = actor.act(ego_frame, waypoint, predictions, actor_frames, lookahead_wp)
+            cruise_target = pace_ctrl.tick(ego_frame)
+
+            # Pre-compute values the lane changer needs (same logic as in act()).
+            tl_state_lc = getattr(ego_frame, 'traffic_light_state',
+                                  carla.TrafficLightState.Unknown)
+            tl_must_stop_lc = (tl_state_lc in (carla.TrafficLightState.Red,
+                                                carla.TrafficLightState.Yellow))
+            rc_lc = 0.0
+            if waypoint is not None and lookahead_wp is not None:
+                _y0 = math.radians(waypoint.transform.rotation.yaw)
+                _y1 = math.radians(lookahead_wp.transform.rotation.yaw)
+                rc_lc = abs((_y1 - _y0 + math.pi) % (2 * math.pi) - math.pi)
+            lc_fired = lane_changer.tick(
+                perception, ego_frame, actor_frames,
+                cruise_target, tl_must_stop_lc, rc_lc)
+
+            control, speed_ceil = actor_ctrl.act(
+                ego_frame, waypoint, predictions, actor_frames, lookahead_wp,
+                cruise_target=cruise_target)
             ego.apply_control(control)
 
             speed = math.hypot(ego_frame.velocity.x, ego_frame.velocity.y)
             tl_state = getattr(ego_frame, 'traffic_light_state', carla.TrafficLightState.Unknown)
+            rt_flag  = getattr(ego_frame, 'turning_right', False)
             print(
                 f"[AD] speed={speed:.1f} m/s ({speed*3.6:.1f} km/h)  "
-                f"ceiling={speed_ceil:.1f} m/s  "
-                f"tl={tl_state}  "
-                f"throttle={control.throttle:.2f}  "
-                f"brake={control.brake:.2f}  "
-                f"steer={control.steer:.3f}  "
-                f"actors_nearby={len(actor_frames)}"
+                f"ceil={speed_ceil:.1f} pace={cruise_target:.1f} m/s  "
+                f"lap={pace_ctrl.lap_count} dist={pace_ctrl.odometer:.0f}m t={pace_ctrl.elapsed:.0f}s  "
+                f"tl={tl_state}{'(RT)' if rt_flag else ''}  "
+                f"tl_dist={getattr(ego_frame, 'traffic_light_dist', float('inf')):.1f}m  "
+                f"{'LC! ' if lc_fired else ''}"
+                f"throttle={control.throttle:.2f}  brake={control.brake:.2f}  "
+                f"steer={control.steer:.3f}"
             )
 
     finally:
